@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/go-test/deep"
@@ -98,6 +99,40 @@ var (
 		Port: 2,
 		ForZones: []v1.ForZone{
 			{Name: "west-1b"},
+		},
+	}
+	AddressOnTest123Node = watcher.Address{
+		IP:   "1.1.1.1",
+		Port: 1,
+		Pod: &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "pod1",
+				Namespace: "ns",
+				Labels: map[string]string{
+					k8s.ControllerNSLabel:    "linkerd",
+					k8s.ProxyDeploymentLabel: "deployment-name",
+				},
+			},
+			Spec: corev1.PodSpec{
+				NodeName: "test-123",
+			},
+		},
+	}
+	AddressNotOnTest123Node = watcher.Address{
+		IP:   "1.1.1.2",
+		Port: 2,
+		Pod: &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "pod1",
+				Namespace: "ns",
+				Labels: map[string]string{
+					k8s.ControllerNSLabel:    "linkerd",
+					k8s.ProxyDeploymentLabel: "deployment-name",
+				},
+			},
+			Spec: corev1.PodSpec{
+				NodeName: "test-234",
+			},
 		},
 	}
 )
@@ -323,6 +358,42 @@ func TestEndpointTranslatorForZonedAddresses(t *testing.T) {
 			t.Fatalf("Expecting [%d] updates, got [%d]. Updates: %v", expectedNumUpdates, actualNumUpdates, mockGetServer.updatesReceived)
 		}
 	})
+}
+
+func TestEndpointTranslatorForLocalTrafficPolicy(t *testing.T) {
+	t.Run("Sends one update for add and none for remove", func(t *testing.T) {
+		mockGetServer, translator := makeEndpointTranslator(t)
+		addressSet := mkAddressSetForServices(AddressOnTest123Node, AddressNotOnTest123Node)
+		addressSet.LocalTrafficPolicy = true
+		translator.Add(addressSet)
+		translator.Remove(mkAddressSetForServices(AddressNotOnTest123Node))
+
+		// Only the address meant for AddressOnTest123Node should be added, which means
+		// that when we try to remove the address meant for AddressNotOnTest123Node there
+		// should be no remove update.
+		expectedNumUpdates := 1
+		actualNumUpdates := len(mockGetServer.updatesReceived)
+		if actualNumUpdates != expectedNumUpdates {
+			t.Fatalf("Expecting [%d] updates, got [%d]. Updates: %v", expectedNumUpdates, actualNumUpdates, mockGetServer.updatesReceived)
+		}
+	})
+}
+
+// TestConcurrency, to be triggered with `go test -race`, shouldn't report a race condition
+func TestConcurrency(t *testing.T) {
+	_, translator := makeEndpointTranslator(t)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			translator.Add(mkAddressSetForServices(west1aAddress, west1bAddress))
+			translator.Remove(mkAddressSetForServices(west1bAddress))
+		}()
+	}
+
+	wg.Wait()
 }
 
 func mkAddressSetForServices(gatewayAddresses ...watcher.Address) watcher.AddressSet {
